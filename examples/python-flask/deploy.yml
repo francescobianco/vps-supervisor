@@ -1,0 +1,8 @@
+app: python-flask
+host: root@your-server
+domain: flask.example.com
+build: .
+port: 8000
+healthcheck: /health
+env:
+  GREETING: Ciao da Flask

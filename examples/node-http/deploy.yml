@@ -1,0 +1,6 @@
+app: node-http
+host: root@your-server
+domain: node.example.com
+build: .
+port: 3000
+healthcheck: /health

@@ -1,0 +1,1285 @@
+#!/usr/bin/env python3
+"""vps-supervisor - a tiny Heroku/Piku-like deployer that adapts to the host.
+
+Unlike Piku, it does not take ownership of ports 80/443, and an app is fully
+described by ONE deployment file (any name): host, domain, build, env, ...
+
+The same file works as two things:
+
+  * local CLI   : `vps-supervisor deploy app.yml` checks everything (ssh, agent,
+                  docker, proxy, DNS), provisions the host if needed, uploads
+                  the app and verifies it is reachable.
+  * remote agent: `vps-supervisor agent <cmd>` runs on the host, classifies the
+                  existing web stack (nginx, caddy, traefik, docker, ...) and
+                  plugs containers into it.
+
+Only the Python standard library is required (Python >= 3.8 on both sides);
+PyYAML is used locally when available, otherwise a built-in YAML subset parser.
+"""
+
+import argparse
+import datetime
+import hashlib
+import io
+import ipaddress
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.error
+import urllib.request
+
+VERSION = "0.2.0"
+MIN_PYTHON = (3, 8)
+WEB_PORTS = (80, 443)
+ROOT_BASE = "/opt/vps-supervisor"
+USER_BASE = "~/.vps-supervisor"
+GLOBAL_LINK = "/usr/local/bin/vps-supervisor"
+KEEP_RELEASES = 3
+DEPLOYABLE_MODES = ("traefik-docker", "none", "manual")
+# docker: app runs in an isolated container; host: app runs on the machine (planned, e.g. systemd unit)
+RUNTIMES = ("docker", "host")
+
+# Shell probe executed on the remote host before anything is uploaded.
+# Prints key=value lines; must work with a plain POSIX sh.
+REMOTE_PROBE = r"""
+echo "uid=$(id -u)"
+echo "user=$(id -un)"
+echo "home=$HOME"
+if command -v python3 >/dev/null 2>&1; then
+  echo "python3=$(command -v python3)"
+  echo "python_version=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+fi
+if command -v docker >/dev/null 2>&1; then echo "docker=$(command -v docker)"; fi
+if command -v apt-get >/dev/null 2>&1; then echo "apt=1"; fi
+if sudo -n true >/dev/null 2>&1; then echo "sudo=1"; else echo "sudo=0"; fi
+if [ -r /etc/os-release ]; then . /etc/os-release; echo "os=${ID:-unknown} ${VERSION_ID:-}"; fi
+echo "arch=$(uname -m)"
+"""
+
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def run(cmd, timeout=15):
+    """Run a command, never raise: return (returncode, stdout+stderr)."""
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=timeout, universal_newlines=True)
+        return p.returncode, p.stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, str(e)
+
+
+def die(msg, code=1):
+    print("error: " + msg, file=sys.stderr, flush=True)
+    sys.exit(code)
+
+
+def tail(text, n=30):
+    return "\n".join(text.rstrip().splitlines()[-n:])
+
+
+def is_root():
+    return os.geteuid() == 0
+
+
+def can_sudo():
+    return not is_root() and shutil.which("sudo") is not None and run(["sudo", "-n", "true"])[0] == 0
+
+
+def priv(cmd):
+    """Prefix with `sudo -n` when not root and sudo is passwordless."""
+    return cmd if is_root() or not can_sudo() else ["sudo", "-n"] + cmd
+
+
+def write_private(path, text):
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def read_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {} if default is None else default
+
+
+def norm_ip(addr):
+    try:
+        return str(ipaddress.ip_address(addr.split("%")[0]))
+    except ValueError:
+        return None
+
+
+# --------------------------------------------------------------------------
+# agent: detection / classification of the existing web stack
+# --------------------------------------------------------------------------
+
+def listeners_ss():
+    """Return {port: set(process names)} for web ports using `ss`, or None."""
+    if not shutil.which("ss"):
+        return None
+    rc, out = run(priv(["ss", "-ltnpH"]))
+    if rc != 0:
+        rc, out = run(["ss", "-ltnH"])
+        if rc != 0:
+            return None
+    result = {}
+    for line in out.splitlines():
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        try:
+            port = int(fields[3].rsplit(":", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        if port in WEB_PORTS:
+            result.setdefault(port, set()).update(re.findall(r'\("([^"]+)",pid=', line))
+    return result
+
+
+def listeners_proc():
+    """Fallback without `ss`: parse /proc/net/tcp{,6} (no process names)."""
+    result = {}
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(path) as f:
+                next(f)
+                for line in f:
+                    parts = line.split()
+                    if len(parts) > 3 and parts[3] == "0A":  # LISTEN
+                        port = int(parts[1].rsplit(":", 1)[1], 16)
+                        if port in WEB_PORTS:
+                            result.setdefault(port, set())
+        except OSError:
+            pass
+    return result
+
+
+def host_addresses():
+    """Public-facing addresses of the host (docker/bridge interfaces excluded)."""
+    rc, out = run(["ip", "-o", "addr", "show", "scope", "global"])
+    addrs = []
+    if rc == 0:
+        for line in out.splitlines():
+            f = line.split()
+            if len(f) < 4 or f[1].startswith(("docker", "br-", "veth", "virbr", "cni", "flannel", "cali")):
+                continue
+            ip = norm_ip(f[3].split("/")[0])
+            if ip:
+                addrs.append(ip)
+    return addrs
+
+
+def traefik_params(docker_cmd, container, port_map):
+    """Read a dockerised Traefik's static config from its CLI args."""
+    rc, out = run(docker_cmd + ["inspect", "--format", "{{json .Args}}", container])
+    args = json.loads(out) if rc == 0 and out.strip() else []
+    rc, out = run(docker_cmd + ["inspect", "--format", "{{json .NetworkSettings.Networks}}", container])
+    networks = sorted(json.loads(out)) if rc == 0 and out.strip() else []
+
+    entrypoints, resolvers, config_files = {}, [], []
+    network, exposed = None, True
+    for a in args or []:
+        if not a.startswith("--"):
+            continue
+        key, _, val = a[2:].partition("=")
+        low = key.lower()
+        if low == "providers.docker.network":
+            network = val
+        elif low == "providers.docker.exposedbydefault":
+            exposed = val.lower() != "false"
+        elif low == "configfile":
+            config_files.append(val)
+        m = re.match(r"entrypoints\.([^.]+)\.address$", key, re.I)
+        if m:
+            port = val.rsplit(":", 1)[-1].split("/")[0]
+            if port.isdigit():
+                entrypoints[m.group(1)] = int(port)
+        m = re.match(r"certificatesresolvers\.([^.]+)\.", key, re.I)
+        if m and m.group(1) not in resolvers:
+            resolvers.append(m.group(1))
+
+    # entrypoint whose container port is published on host 443 / 80
+    by_container_port = {cp: hp for hp, cp in port_map.items()}
+    https_ep = next((n for n, p in entrypoints.items() if by_container_port.get(p) == 443), None)
+    http_ep = next((n for n, p in entrypoints.items() if by_container_port.get(p) == 80), None)
+    if network is None and len(networks) == 1:
+        network = networks[0]
+    return {
+        "network": network,
+        "entrypoint": https_ep,
+        "http_entrypoint": http_ep,
+        "certresolver": resolvers[0] if resolvers else None,
+        "certresolvers": resolvers,
+        "exposed_by_default": exposed,
+        "entrypoints": entrypoints,
+        "networks": networks,
+        "config_files": config_files,
+        "complete": bool(network and https_ep),
+    }
+
+
+def detect_docker():
+    info = {"installed": shutil.which("docker") is not None, "accessible": False,
+            "version": None, "command": None, "web_containers": []}
+    if not info["installed"]:
+        return info
+    for cmd in (["docker"], ["sudo", "-n", "docker"]):
+        if cmd[0] == "sudo" and not can_sudo():
+            continue
+        rc, out = run(cmd + ["info", "--format", "{{.ServerVersion}}"])
+        if rc == 0:
+            info.update(accessible=True, version=out.strip(), command=cmd)
+            break
+    if info["accessible"]:
+        rc, out = run(info["command"] + ["ps", "--format", "{{.Names}}\t{{.Image}}\t{{.Ports}}"])
+        if rc == 0:
+            for line in out.splitlines():
+                name, image, ports = (line.split("\t") + ["", ""])[:3]
+                port_map = {}
+                for hp, cp in re.findall(r":(\d+)->(\d+)/tcp", ports):
+                    if int(hp) in WEB_PORTS:
+                        port_map[int(hp)] = int(cp)
+                if port_map:
+                    c = {"name": name, "image": image, "ports": sorted(port_map), "port_map": port_map}
+                    if "traefik" in image.lower():
+                        c["traefik"] = traefik_params(info["command"], name, port_map)
+                    info["web_containers"].append(c)
+    return info
+
+
+def first_existing(paths):
+    for p in paths:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def decide_proxy(ports, docker):
+    """Classify who owns 80/443 and how apps can be plugged in."""
+    owners = set()
+    for names in ports.values():
+        owners |= set(names)
+    busy = [p for p in WEB_PORTS if p in ports]
+
+    def writable(path):
+        return bool(path) and (os.access(path, os.W_OK) or is_root() or can_sudo())
+
+    if "nginx" in owners:
+        d = first_existing(["/etc/nginx/conf.d", "/etc/nginx/sites-enabled", "/etc/nginx/http.d"])
+        return {"mode": "nginx", "params": {"config_dir": d, "writable": writable(d)},
+                "reason": "nginx is listening on %s" % busy}
+    if "caddy" in owners:
+        f = first_existing(["/etc/caddy/Caddyfile"])
+        return {"mode": "caddy", "params": {"config_file": f, "writable": writable(f)},
+                "reason": "caddy is listening on %s" % busy}
+    if owners & {"apache2", "httpd"}:
+        d = first_existing(["/etc/apache2/sites-enabled", "/etc/httpd/conf.d"])
+        return {"mode": "apache", "params": {"config_dir": d, "writable": writable(d)},
+                "reason": "apache is listening on %s" % busy}
+    if "haproxy" in owners:
+        return {"mode": "haproxy", "params": {"config_file": first_existing(["/etc/haproxy/haproxy.cfg"])},
+                "reason": "haproxy is listening on %s" % busy}
+    if "traefik" in owners:
+        return {"mode": "traefik", "params": {}, "reason": "traefik (native) is listening on %s" % busy}
+    if docker["web_containers"]:
+        c = next((x for x in docker["web_containers"] if "traefik" in x), docker["web_containers"][0])
+        image = c["image"].lower()
+        if "traefik" in c:
+            p = c["traefik"]
+            return {"mode": "traefik-docker", "container": c["name"], "image": c["image"], "params": p,
+                    "reason": "traefik container %s publishes %s (network=%s, entrypoint=%s, certresolver=%s)"
+                              % (c["name"], c["ports"], p["network"], p["entrypoint"], p["certresolver"])}
+        mode = "docker-container"
+        for key, m in (("caddy", "caddy-docker"), ("nginx-proxy", "nginx-proxy-docker"),
+                       ("nginx-proxy-manager", "npm-docker")):
+            if key in image:
+                mode = m
+        return {"mode": mode, "container": c["name"], "image": c["image"], "params": {},
+                "reason": "container %s (%s) publishes %s" % (c["name"], c["image"], c["ports"])}
+    if not busy:
+        return {"mode": "none", "params": {},
+                "reason": "ports 80/443 are free: apps are exposed on 127.0.0.1 until a proxy is chosen"}
+    return {"mode": "manual", "params": {},
+            "reason": "ports %s are busy but the owner is unknown (needs root/sudo to identify); "
+                      "apps are exposed on 127.0.0.1 only" % busy}
+
+
+def detect():
+    ports = listeners_ss()
+    method = "ss"
+    if ports is None:
+        ports, method = listeners_proc(), "/proc/net/tcp"
+    binaries = {b: shutil.which(b) for b in
+                ("nginx", "caddy", "apache2", "httpd", "haproxy", "traefik", "git", "systemctl")}
+    docker = detect_docker()
+    return {
+        "detected_at": now_iso(),
+        "user": os.environ.get("USER") or str(os.geteuid()),
+        "root": is_root(),
+        "sudo": can_sudo(),
+        "addresses": host_addresses(),
+        "ports": {str(p): {"listening": p in ports, "processes": sorted(ports.get(p, []))}
+                  for p in WEB_PORTS},
+        "ports_method": method,
+        "binaries": {k: v for k, v in binaries.items() if v},
+        "docker": docker,
+        "proxy": decide_proxy(ports, docker),
+    }
+
+
+# --------------------------------------------------------------------------
+# agent commands (run on the host)
+# --------------------------------------------------------------------------
+
+def agent_base(args):
+    return os.path.expanduser(args.base or os.environ.get("VPS_SUPERVISOR_HOME")
+                              or (ROOT_BASE if is_root() else USER_BASE))
+
+
+def config_path(base):
+    return os.path.join(base, "config.json")
+
+
+def cmd_agent_init(args):
+    base = agent_base(args)
+    for sub in ("bin", "apps", "logs", "state"):
+        os.makedirs(os.path.join(base, sub), exist_ok=True)
+    cfg = read_json(config_path(base))
+    det = detect()
+    cfg.update({
+        "version": VERSION,
+        "base": base,
+        "installed_at": cfg.get("installed_at") or now_iso(),
+        "updated_at": now_iso(),
+        "proxy": det["proxy"],
+        "docker_command": det["docker"]["command"],
+        "detection": det,
+    })
+    write_private(config_path(base), json.dumps(cfg, indent=2))
+    if is_root():
+        me = os.path.join(base, "bin", "vps-supervisor")
+        try:
+            if os.path.islink(GLOBAL_LINK) or not os.path.exists(GLOBAL_LINK):
+                if os.path.islink(GLOBAL_LINK):
+                    os.unlink(GLOBAL_LINK)
+                os.symlink(me, GLOBAL_LINK)
+        except OSError:
+            pass
+    print(json.dumps(cfg, indent=2))
+
+
+def cmd_agent_detect(args):
+    print(json.dumps(detect(), indent=2))
+
+
+def cmd_agent_status(args):
+    base = agent_base(args)
+    cfg = read_json(config_path(base))
+    if not cfg:
+        die("agent not initialised in %s" % base)
+    apps = {}
+    appsdir = os.path.join(base, "apps")
+    for app in sorted(os.listdir(appsdir)) if os.path.isdir(appsdir) else []:
+        cur = read_json(os.path.join(appsdir, app, "state.json")).get("current")
+        if cur:
+            apps[app] = {k: cur.get(k) for k in ("release", "image", "domain", "deployed_at")}
+    cfg["apps"] = apps
+    print(json.dumps(cfg, indent=2))
+
+
+def cmd_agent_version(args):
+    print(VERSION)
+
+
+def cmd_agent_provision(args):
+    """Install host prerequisites (currently: docker) on apt-based systems."""
+    if shutil.which("docker"):
+        print("docker already installed")
+        return
+    if not is_root():
+        die("installing docker requires root")
+    if not shutil.which("apt-get"):
+        die("automatic docker install is only supported on apt-based systems; install docker manually")
+    env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
+    for cmd in (["apt-get", "update", "-qq"], ["apt-get", "install", "-y", "-qq", "docker.io"]):
+        print("    $ " + " ".join(cmd), flush=True)
+        if subprocess.call(cmd, env=env) != 0:
+            die("command failed: " + " ".join(cmd))
+    run(["systemctl", "enable", "--now", "docker"], timeout=60)
+    print("docker installed")
+
+
+def safe_extract(tar, dest):
+    if hasattr(tarfile, "data_filter"):
+        tar.extractall(dest, filter="data")
+        return
+    root = os.path.realpath(dest)
+    for m in tar.getmembers():
+        target = os.path.realpath(os.path.join(dest, m.name))
+        if m.isdev() or not (target == root or target.startswith(root + os.sep)):
+            die("unsafe path in upload: %s" % m.name)
+        if m.issym() or m.islnk():
+            link = os.path.realpath(os.path.join(os.path.dirname(target), m.linkname))
+            if not link.startswith(root + os.sep):
+                die("unsafe link in upload: %s -> %s" % (m.name, m.linkname))
+    tar.extractall(dest)
+
+
+def free_port(start=20000, end=29999, taken=()):
+    for port in range(start, end):
+        if port in taken:
+            continue
+        with socket.socket() as s:
+            try:
+                s.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    die("no free port in %d-%d" % (start, end))
+
+
+def wait_healthy(docker, name, url_of, timeout=60):
+    deadline = time.time() + timeout
+    last = "no answer"
+    while time.time() < deadline:
+        _, st = run(docker + ["inspect", "-f", "{{.State.Status}}", name])
+        st = st.strip()
+        if st in ("exited", "dead"):
+            return False, "container %s" % st
+        url = url_of()
+        if url:
+            try:
+                with urllib.request.urlopen(url, timeout=3) as r:
+                    return True, "%s -> %d" % (url, r.status)
+            except urllib.error.HTTPError as e:
+                if e.code < 500:
+                    return True, "%s -> %d" % (url, e.code)
+                last = "%s -> %d" % (url, e.code)
+            except Exception as e:  # connection refused, timeout, ...
+                last = "%s: %s" % (url, e)
+        time.sleep(1)
+    return False, "timeout after %ds (%s)" % (timeout, last)
+
+
+def cmd_agent_deploy(args):
+    """Deploy an app; the resolved spec comes as JSON on stdin."""
+    base = agent_base(args)
+    cfg = read_json(config_path(base))
+    docker = cfg.get("docker_command") or die("docker is not accessible on this host")
+    spec = json.load(sys.stdin)
+    app, proxy = spec["app"], spec["proxy"]
+    name = "vps-" + app
+    appdir = os.path.join(base, "apps", app)
+    os.makedirs(appdir, exist_ok=True)
+    state_file = os.path.join(appdir, "state.json")
+    state = read_json(state_file)
+    release = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
+
+    def step(msg):
+        print("    " + msg, flush=True)
+
+    def dk(*a, check=True, timeout=1800):
+        rc, out = run(docker + list(a), timeout=timeout)
+        if check and rc != 0:
+            die("docker %s failed:\n%s" % (a[0], tail(out)))
+        return out
+
+    # 1. image
+    if spec.get("build"):
+        rel = os.path.join(appdir, "releases", release)
+        os.makedirs(rel)
+        upload = os.path.join(appdir, "incoming.tar")
+        with tarfile.open(upload) as t:
+            safe_extract(t, rel)
+        os.remove(upload)
+        image = "%s:%s" % (name, release)
+        step("building image %s" % image)
+        dk("build", "-t", image, "-f", os.path.join(rel, spec["build"]["dockerfile"]), rel)
+    else:
+        image = spec["image"]
+        step("pulling image %s" % image)
+        dk("pull", image)
+
+    # 2. container definition
+    env_file = os.path.join(appdir, "env")
+    write_private(env_file, "".join("%s=%s\n" % kv for kv in sorted(spec["env"].items())))
+    labels = {"vps-supervisor.app": app, "vps-supervisor.release": release}
+    runargs = ["run", "-d", "--name", name, "--restart", "unless-stopped", "--env-file", env_file]
+    mode, params = proxy["mode"], proxy["params"]
+    if mode == "traefik-docker":
+        r, domain, net = name, spec["domain"], params["network"]
+        labels.update({
+            "vps-supervisor.domain": domain,
+            "traefik.enable": "true",
+            "traefik.docker.network": net,
+            "traefik.http.routers.%s.rule" % r: "Host(`%s`)" % domain,
+            "traefik.http.routers.%s.entrypoints" % r: params["entrypoint"],
+            "traefik.http.routers.%s.tls" % r: "true",
+            "traefik.http.routers.%s.service" % r: r,
+            "traefik.http.services.%s.loadbalancer.server.port" % r: str(spec["port"]),
+        })
+        if params.get("certresolver"):
+            labels["traefik.http.routers.%s.tls.certresolver" % r] = params["certresolver"]
+        if params.get("http_entrypoint"):
+            labels.update({
+                "traefik.http.routers.%s-http.rule" % r: "Host(`%s`)" % domain,
+                "traefik.http.routers.%s-http.entrypoints" % r: params["http_entrypoint"],
+                "traefik.http.routers.%s-http.middlewares" % r: "%s-https" % r,
+                "traefik.http.routers.%s-http.service" % r: r,
+                "traefik.http.middlewares.%s-https.redirectscheme.scheme" % r: "https",
+            })
+        runargs += ["--network", net]
+        ip_fmt = "{{with index .NetworkSettings.Networks %s}}{{.IPAddress}}{{end}}" % json.dumps(net)
+
+        def url_of():
+            ip = dk("inspect", "-f", ip_fmt, name, check=False).strip()
+            return "http://%s:%d%s" % (ip, spec["port"], spec["healthcheck"]) if ip else None
+    else:
+        state["host_port"] = state.get("host_port") or free_port()
+        runargs += ["-p", "127.0.0.1:%d:%d" % (state["host_port"], spec["port"])]
+
+        def url_of():
+            return "http://127.0.0.1:%d%s" % (state["host_port"], spec["healthcheck"])
+    for k, v in sorted(labels.items()):
+        runargs += ["--label", "%s=%s" % (k, v)]
+    for v in spec["volumes"]:
+        runargs += ["-v", v]
+    runargs.append(image)
+
+    # 3. swap container, health check, rollback on failure
+    previous = state.get("current")
+    step("starting container %s" % name)
+    dk("rm", "-f", name, check=False)
+    dk(*runargs)
+    ok, detail = wait_healthy(docker, name, url_of)
+    if not ok:
+        logs = dk("logs", "--tail", "40", name, check=False)
+        dk("rm", "-f", name, check=False)
+        if previous:
+            step("rolling back to release %s" % previous["release"])
+            dk(*previous["run"], check=False)
+        die("health check failed: %s\n--- container logs ---\n%s" % (detail, tail(logs, 40)))
+    step("healthy: %s" % detail)
+
+    state["current"] = {"release": release, "image": image, "run": runargs,
+                        "domain": spec.get("domain"), "deployed_at": now_iso()}
+    state["spec"] = spec
+    write_private(state_file, json.dumps(state, indent=2))
+
+    # 4. prune old releases
+    relroot = os.path.join(appdir, "releases")
+    if os.path.isdir(relroot):
+        for old in sorted(os.listdir(relroot))[:-KEEP_RELEASES]:
+            shutil.rmtree(os.path.join(relroot, old), ignore_errors=True)
+            dk("rmi", "%s:%s" % (name, old), check=False)
+
+    print("RESULT " + json.dumps({"release": release, "image": image, "container": name,
+                                  "mode": mode, "host_port": state.get("host_port")}), flush=True)
+
+
+def cmd_agent_destroy(args):
+    base = agent_base(args)
+    docker = read_json(config_path(base)).get("docker_command") or die("docker is not accessible")
+    name = "vps-" + args.app
+    run(docker + ["rm", "-f", name], timeout=60)
+    _, out = run(docker + ["images", name, "--format", "{{.Repository}}:{{.Tag}}"])
+    for img in out.split():
+        run(docker + ["rmi", img], timeout=60)
+    shutil.rmtree(os.path.join(base, "apps", args.app), ignore_errors=True)
+    print("destroyed %s" % args.app)
+
+
+def cmd_agent_logs(args):
+    docker = read_json(config_path(agent_base(args))).get("docker_command") or die("docker is not accessible")
+    os.execvp(docker[0], docker + ["logs", "--tail", str(args.lines), "vps-" + args.app])
+
+
+# --------------------------------------------------------------------------
+# deployment file
+# --------------------------------------------------------------------------
+
+APP_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
+DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+SPEC_KEYS = ("app", "runtime", "host", "domain", "build", "image", "port", "healthcheck", "env", "volumes", "proxy")
+
+
+def _strip_comment(line):
+    quote = None
+    for i, ch in enumerate(line):
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "#" and (i == 0 or line[i - 1].isspace()):
+            return line[:i].rstrip()
+    return line.rstrip()
+
+
+def _scalar(s):
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        return s[1:-1]
+    if s.startswith("[") and s.endswith("]"):
+        return [_scalar(x) for x in s[1:-1].split(",") if x.strip()]
+    if s == "{}":
+        return {}
+    low = s.lower()
+    if low in ("true", "yes"):
+        return True
+    if low in ("false", "no"):
+        return False
+    if low in ("null", "~", ""):
+        return None
+    if re.match(r"^-?\d+$", s):
+        return int(s)
+    return s
+
+
+def mini_yaml(text):
+    """Tiny YAML subset: nested maps, lists of scalars, scalars, comments."""
+    lines = []
+    for raw in text.splitlines():
+        if raw.strip() in ("---", "..."):
+            continue
+        s = _strip_comment(raw)
+        if s.strip():
+            lines.append((len(s) - len(s.lstrip()), s.strip()))
+
+    def block(i, ind):
+        if lines[i][1].startswith("- ") or lines[i][1] == "-":
+            out = []
+            while i < len(lines) and lines[i][0] == ind and (lines[i][1].startswith("- ") or lines[i][1] == "-"):
+                item = lines[i][1][1:].strip()
+                i += 1
+                if item:
+                    out.append(_scalar(item))
+                elif i < len(lines) and lines[i][0] > ind:
+                    v, i = block(i, lines[i][0])
+                    out.append(v)
+                else:
+                    out.append(None)
+            return out, i
+        out = {}
+        while i < len(lines) and lines[i][0] == ind:
+            m = re.match(r"^(\"[^\"]*\"|'[^']*'|[^:]+?)\s*:(?:\s+(.*))?$", lines[i][1])
+            if not m:
+                raise ValueError("cannot parse line: %r" % lines[i][1])
+            key, rest = _scalar(m.group(1)), m.group(2)
+            i += 1
+            if rest is not None and rest != "":
+                out[key] = _scalar(rest)
+            elif i < len(lines) and (lines[i][0] > ind or
+                                     (lines[i][0] == ind and lines[i][1].startswith("- "))):
+                out[key], i = block(i, lines[i][0])
+            else:
+                out[key] = None
+        return out, i
+
+    if not lines:
+        return {}
+    value, i = block(0, lines[0][0])
+    if i != len(lines):
+        raise ValueError("unexpected indentation at: %r" % lines[i][1])
+    return value
+
+
+def load_yaml(path):
+    with open(path) as f:
+        text = f.read()
+    try:
+        import yaml
+    except ImportError:
+        return mini_yaml(text)
+    return yaml.safe_load(text)
+
+
+def load_spec(path):
+    try:
+        raw = load_yaml(path)
+    except OSError as e:
+        die("cannot read %s: %s" % (path, e))
+    except Exception as e:  # yaml.YAMLError, ValueError
+        die("cannot parse %s: %s" % (path, e))
+    if not isinstance(raw, dict):
+        die("%s: expected a mapping at top level" % path)
+
+    errors = []
+    unknown = sorted(set(raw) - set(SPEC_KEYS))
+    if unknown:
+        errors.append("unknown keys: %s (allowed: %s)" % (", ".join(map(str, unknown)), ", ".join(SPEC_KEYS)))
+
+    app = raw.get("app")
+    if not isinstance(app, str) or not APP_RE.match(app):
+        errors.append("app: required, lowercase letters/digits/dashes (got %r)" % app)
+
+    runtime = raw.get("runtime", "docker")
+    if runtime not in RUNTIMES:
+        errors.append("runtime: one of %s (got %r)" % (", ".join(RUNTIMES), runtime))
+    elif runtime != "docker":
+        errors.append("runtime: `%s` (app run directly on the machine) is planned but not implemented yet"
+                      % runtime)
+
+    host = raw.get("host")
+    if isinstance(host, str):
+        host = {"ssh": host}
+    if not isinstance(host, dict) or not isinstance(host.get("ssh"), str) or not host["ssh"]:
+        errors.append("host: required, e.g. `host: root@1.2.3.4` or `host: {ssh: ..., port: 22}`")
+        host = {}
+
+    domain = raw.get("domain")
+    if domain is not None:
+        domain = str(domain).lower().rstrip(".")
+        if not DOMAIN_RE.match(domain):
+            errors.append("domain: invalid hostname %r" % domain)
+
+    build, image = raw.get("build"), raw.get("image")
+    if (build is None) == (image is None):
+        errors.append("exactly one of `build` (local Dockerfile dir) or `image` (registry image) is required")
+    if isinstance(build, str):
+        build = {"context": build}
+    if build is not None:
+        if not isinstance(build, dict):
+            errors.append("build: expected a path or {context, dockerfile}")
+            build = None
+        else:
+            here = os.path.dirname(os.path.abspath(path))
+            ctx = os.path.normpath(os.path.join(here, os.path.expanduser(str(build.get("context", ".")))))
+            dockerfile = str(build.get("dockerfile", "Dockerfile"))
+            if not os.path.isfile(os.path.join(ctx, dockerfile)):
+                errors.append("build: %s not found in %s" % (dockerfile, ctx))
+            build = {"context": ctx, "dockerfile": dockerfile}
+    if image is not None and not isinstance(image, str):
+        errors.append("image: expected a string")
+
+    port = raw.get("port")
+    if not isinstance(port, int) or not 0 < port < 65536:
+        errors.append("port: required, the port the app listens on inside the container")
+
+    health = raw.get("healthcheck", "/")
+    if not isinstance(health, str) or not health.startswith("/"):
+        errors.append("healthcheck: expected a path starting with /")
+
+    env = raw.get("env") or {}
+    if not isinstance(env, dict):
+        errors.append("env: expected a mapping")
+        env = {}
+    env = {str(k): ("" if v is None else str(v).lower() if isinstance(v, bool) else str(v))
+           for k, v in env.items()}
+    for k, v in env.items():
+        if not ENV_RE.match(k):
+            errors.append("env: invalid variable name %r" % k)
+        if "\n" in v:
+            errors.append("env: %s must be a single line" % k)
+
+    volumes = raw.get("volumes") or []
+    if not isinstance(volumes, list) or not all(isinstance(v, str) and ":" in v for v in volumes):
+        errors.append("volumes: expected a list of `source:target[:ro]`")
+        volumes = []
+
+    proxy = raw.get("proxy") or {}
+    if not isinstance(proxy, dict):
+        errors.append("proxy: expected a mapping of overrides")
+        proxy = {}
+
+    if errors:
+        die("invalid deployment file %s:\n  - %s" % (path, "\n  - ".join(errors)))
+    return {"app": app, "runtime": runtime, "host": host, "domain": domain, "build": build, "image": image, "port": port,
+            "healthcheck": health, "env": env, "volumes": volumes, "proxy": proxy}
+
+
+def resolve_proxy(cfg, spec):
+    """Merge detected proxy params with overrides; check the mode is deployable."""
+    proxy = dict(cfg.get("proxy") or {})
+    params = dict(proxy.get("params") or {})
+    overrides = spec["proxy"]
+    if "mode" in overrides:
+        proxy["mode"] = overrides["mode"]
+    for k in ("network", "entrypoint", "http_entrypoint", "certresolver"):
+        if k in overrides:
+            params[k] = overrides[k]
+    proxy["params"] = params
+    mode = proxy.get("mode")
+    if mode not in DEPLOYABLE_MODES:
+        die("proxy mode `%s` (%s) is classified but not deployable yet; supported: %s"
+            % (mode, proxy.get("reason"), ", ".join(DEPLOYABLE_MODES)))
+    if mode == "traefik-docker":
+        missing = [k for k in ("network", "entrypoint") if not params.get(k)]
+        if missing:
+            die("traefik detected but %s could not be read from its config; set them under `proxy:` "
+                "in the deployment file" % " and ".join(missing))
+        if not spec["domain"]:
+            die("`domain` is required with proxy mode traefik-docker")
+    return proxy
+
+
+def check_dns(domain, host_ips):
+    found = set()
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            for ai in socket.getaddrinfo(domain, None, family, socket.SOCK_STREAM):
+                ip = norm_ip(ai[4][0])
+                if ip:
+                    found.add(ip)
+        except socket.gaierror:
+            pass
+    v4 = sorted(ip for ip in host_ips if ":" not in ip)
+    if not found:
+        return found, ["%s does not resolve: create a DNS A record %s -> %s"
+                       % (domain, domain, v4[0] if v4 else "<host ip>")]
+    wrong = sorted(found - host_ips)
+    if wrong:
+        return found, ["%s resolves to %s, which is not this host (%s)"
+                       % (domain, ", ".join(wrong), ", ".join(sorted(host_ips)))]
+    return found, []
+
+
+def pack_context(ctx):
+    def keep(ti):
+        if os.path.basename(ti.name) in (".git", "__pycache__"):
+            return None
+        ti.uid = ti.gid = 0
+        ti.uname = ti.gname = ""
+        return ti
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as t:
+        t.add(ctx, arcname=".", filter=keep)
+    return buf.getvalue()
+
+
+def verify_https(url, timeout=120):
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=10) as r:
+                return True, "%s -> %d" % (url, r.status)
+        except urllib.error.HTTPError as e:
+            if e.code < 500:
+                return True, "%s -> %d" % (url, e.code)
+            last = "HTTP %d" % e.code
+        except Exception as e:  # TLS not ready yet, DNS caches, ...
+            last = str(getattr(e, "reason", e))
+        time.sleep(5)
+    return False, "%s: %s" % (url, last)
+
+
+# --------------------------------------------------------------------------
+# local side: ssh plumbing
+# --------------------------------------------------------------------------
+
+def ssh_base(args):
+    cmd = shlex.split(os.environ.get("VPS_SUPERVISOR_SSH", "ssh"))
+    if args.port:
+        cmd += ["-p", str(args.port)]
+    if args.identity:
+        cmd += ["-i", os.path.expanduser(args.identity)]
+    for opt in args.ssh_option or []:
+        cmd += ["-o", opt]
+    return cmd
+
+
+def ssh(args, remote, data=None, check=True):
+    p = subprocess.run(ssh_base(args) + [args.target, remote], input=data,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out = p.stdout.decode(errors="replace")
+    err = p.stderr.decode(errors="replace")
+    if check and p.returncode != 0:
+        die("ssh %s failed (exit %d):\n%s%s" % (args.target, p.returncode, out, err))
+    return p.returncode, out, err
+
+
+def ssh_stream(args, remote, data=None):
+    """Run remotely, print output live, return (rc, parsed RESULT line)."""
+    p = subprocess.Popen(ssh_base(args) + [args.target, remote], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    p.stdin.write(data or b"")
+    p.stdin.close()
+    result = None
+    for raw in p.stdout:
+        line = raw.decode(errors="replace").rstrip("\n")
+        if line.startswith("RESULT "):
+            result = json.loads(line[7:])
+        else:
+            print(line, flush=True)
+    return p.wait(), result
+
+
+def ssh_target_ips(args):
+    """IPs the ssh target resolves to locally (honours ~/.ssh/config)."""
+    hostname = args.target.rsplit("@", 1)[-1]
+    rc, out = run(ssh_base(args) + ["-G", args.target])
+    if rc == 0:
+        for line in out.splitlines():
+            if line.startswith("hostname "):
+                hostname = line.split(None, 1)[1].strip()
+    ips = set()
+    try:
+        for ai in socket.getaddrinfo(hostname, None):
+            ip = norm_ip(ai[4][0])
+            if ip:
+                ips.add(ip)
+    except socket.gaierror:
+        pass
+    return ips
+
+
+def probe(args):
+    _, out, _ = ssh(args, "sh -s", REMOTE_PROBE.encode())
+    facts = {}
+    for line in out.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            facts[k.strip()] = v.strip()
+    return facts
+
+
+def ensure_python(args):
+    facts = probe(args)
+    if "python3" not in facts:
+        if facts.get("uid") == "0" and facts.get("apt"):
+            print("    python3 missing: installing it with apt-get")
+            ssh(args, "DEBIAN_FRONTEND=noninteractive apt-get update -qq && "
+                      "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3")
+            facts = probe(args)
+        if "python3" not in facts:
+            die("python3 not found on %s; install it first" % args.target)
+    try:
+        pyver = tuple(int(x) for x in facts.get("python_version", "0.0").split("."))
+    except ValueError:
+        pyver = (0, 0)
+    if pyver < MIN_PYTHON:
+        die("python %s on host is too old, need >= %d.%d" % ((facts.get("python_version"),) + MIN_PYTHON))
+    args.python = facts["python3"]
+    return facts
+
+
+def remote_base(args, facts):
+    if args.prefix:
+        return args.prefix
+    if facts.get("uid") == "0":
+        return ROOT_BASE
+    return facts.get("home", "~").rstrip("/") + "/.vps-supervisor"
+
+
+def remote_agent(args, base, sub):
+    return "%s %s agent %s --base %s" % (
+        shlex.quote(args.python), shlex.quote(base + "/bin/vps-supervisor"), sub, shlex.quote(base))
+
+
+def ensure_agent(args, facts):
+    """Upload the agent if missing/outdated, refresh detection, return (base, cfg)."""
+    base = remote_base(args, facts)
+    dest = base + "/bin/vps-supervisor"
+    with open(os.path.realpath(__file__), "rb") as f:
+        payload = f.read()
+    digest = hashlib.sha256(payload).hexdigest()
+    _, out, _ = ssh(args, "sha256sum %s 2>/dev/null || true" % shlex.quote(dest))
+    if out.split()[:1] != [digest]:
+        print("    uploading agent %s to %s" % (VERSION, dest))
+        q = shlex.quote
+        ssh(args, "mkdir -p %s && cat > %s.new && chmod 755 %s.new && mv %s.new %s" % (
+            q(base + "/bin"), q(dest), q(dest), q(dest), q(dest)), payload)
+    else:
+        print("    agent %s already up to date in %s" % (VERSION, base))
+    _, out, _ = ssh(args, remote_agent(args, base, "init"))
+    try:
+        cfg = json.loads(out)
+    except ValueError:
+        die("unexpected output from agent init:\n" + out)
+    return base, cfg
+
+
+def print_summary(cfg):
+    det = cfg.get("detection", cfg)
+    proxy = cfg.get("proxy") or det.get("proxy", {})
+    docker = det.get("docker", {})
+    print("  user        : %s%s" % (det.get("user"), " (root)" if det.get("root") else
+                                    (" (sudo)" if det.get("sudo") else "")))
+    if det.get("addresses"):
+        print("  addresses   : %s" % ", ".join(det["addresses"]))
+    for p, info in sorted(det.get("ports", {}).items(), key=lambda kv: int(kv[0])):
+        state = "busy " + (",".join(info["processes"]) or "(unknown owner)") if info["listening"] else "free"
+        print("  port %-6s : %s" % (p, state))
+    if docker.get("accessible"):
+        print("  docker      : %s (%s)" % (docker.get("version"), " ".join(docker.get("command") or [])))
+    elif docker.get("installed"):
+        print("  docker      : installed but NOT accessible for this user")
+    else:
+        print("  docker      : not installed")
+    print("  proxy mode  : %s" % proxy.get("mode"))
+    print("                %s" % proxy.get("reason"))
+    for k in ("network", "entrypoint", "http_entrypoint", "certresolver", "config_dir", "config_file"):
+        v = (proxy.get("params") or {}).get(k)
+        if v:
+            print("    %-15s %s" % (k, v))
+
+
+# --------------------------------------------------------------------------
+# local commands
+# --------------------------------------------------------------------------
+
+def cmd_install(args):
+    print("==> probing %s" % args.target)
+    facts = ensure_python(args)
+    print("    user %s, %s %s, python %s, docker %s" % (
+        facts.get("user"), facts.get("os", "?"), facts.get("arch", "?"),
+        facts.get("python_version"), "yes" if facts.get("docker") else "no"))
+    print("==> installing agent")
+    base, cfg = ensure_agent(args, facts)
+    print_summary(cfg)
+    print("==> vps-supervisor %s ready on %s (%s)" % (VERSION, args.target, base))
+
+
+def locate_agent(args):
+    facts = probe(args)
+    if "python3" not in facts:
+        die("python3 not found on %s" % args.target)
+    args.python = facts["python3"]
+    base = remote_base(args, facts)
+    rc, _, _ = ssh(args, "test -x %s" % shlex.quote(base + "/bin/vps-supervisor"), check=False)
+    if rc != 0:
+        die("vps-supervisor is not installed on %s (looked in %s); run install or deploy first"
+            % (args.target, base))
+    return base
+
+
+def cmd_detect(args):
+    base = locate_agent(args)
+    _, out, _ = ssh(args, remote_agent(args, base, "detect"))
+    if args.json:
+        print(out, end="")
+    else:
+        print_summary(json.loads(out))
+
+
+def cmd_status(args):
+    base = locate_agent(args)
+    _, out, _ = ssh(args, remote_agent(args, base, "status"))
+    if args.json:
+        print(out, end="")
+        return
+    cfg = json.loads(out)
+    print("  version     : %s (installed %s)" % (cfg.get("version"), cfg.get("installed_at")))
+    print("  base        : %s" % cfg.get("base"))
+    print_summary(cfg)
+    print("  apps        : %s" % (", ".join(
+        "%s (%s, %s)" % (a, i.get("domain") or "-", i.get("release")) for a, i in cfg.get("apps", {}).items())
+        or "none"))
+
+
+def cmd_uninstall(args):
+    base = locate_agent(args)
+    if not args.yes:
+        answer = input("Remove %s on %s (app state included; containers keep running)? [y/N] "
+                       % (base, args.target))
+        if answer.strip().lower() not in ("y", "yes"):
+            print("aborted")
+            return
+    ssh(args, "if [ \"$(readlink %s 2>/dev/null)\" = %s ]; then rm -f %s; fi; rm -rf %s" % (
+        GLOBAL_LINK, shlex.quote(base + "/bin/vps-supervisor"), GLOBAL_LINK, shlex.quote(base)))
+    print("==> removed vps-supervisor from %s" % args.target)
+
+
+def host_args(spec, prefix=None):
+    h = spec["host"]
+    return argparse.Namespace(target=h["ssh"], port=h.get("port"), identity=h.get("identity"),
+                              ssh_option=h.get("ssh_options") or [], prefix=prefix or h.get("prefix"))
+
+
+def cmd_deploy(args):
+    total = 7
+
+    def stage(n, msg):
+        print("==> [%d/%d] %s" % (n, total, msg), flush=True)
+
+    stage(1, "reading %s" % args.file)
+    spec = load_spec(args.file)
+    src = ("build %s" % os.path.relpath(spec["build"]["context"])) if spec["build"] else "image " + spec["image"]
+    print("    app %s, %s, port %d, domain %s" % (spec["app"], src, spec["port"], spec["domain"] or "-"))
+    h = host_args(spec)
+
+    stage(2, "connecting to %s" % h.target)
+    facts = ensure_python(h)
+    print("    user %s, %s %s, python %s" % (facts.get("user"), facts.get("os", "?"),
+                                             facts.get("arch", "?"), facts.get("python_version")))
+
+    stage(3, "provisioning agent")
+    base, cfg = ensure_agent(h, facts)
+    if not cfg["detection"]["docker"]["installed"]:
+        print("    docker missing: provisioning")
+        rc, _ = ssh_stream(h, remote_agent(h, base, "provision"))
+        if rc != 0:
+            die("provisioning failed")
+        base, cfg = ensure_agent(h, facts)
+    if not cfg["detection"]["docker"]["accessible"]:
+        die("docker is installed but not usable by %s (add the user to the docker group or use root)"
+            % facts.get("user"))
+    print("    docker %s" % cfg["detection"]["docker"]["version"])
+
+    stage(4, "proxy integration")
+    proxy = resolve_proxy(cfg, spec)
+    print("    mode %s: %s" % (proxy["mode"], proxy.get("reason")))
+    for k in ("network", "entrypoint", "http_entrypoint", "certresolver"):
+        if proxy["params"].get(k):
+            print("    %-15s %s" % (k, proxy["params"][k]))
+
+    stage(5, "DNS")
+    dns_ok = False
+    if not spec["domain"]:
+        print("    no domain: skipped")
+    else:
+        host_ips = set(cfg["detection"].get("addresses") or []) | ssh_target_ips(h)
+        found, problems = check_dns(spec["domain"], host_ips)
+        if problems and not args.skip_dns:
+            die("DNS check failed:\n  - " + "\n  - ".join(problems) + "\n(use --skip-dns to deploy anyway)")
+        for p in problems:
+            print("    warning: %s (ignored: --skip-dns)" % p)
+        if not problems:
+            dns_ok = True
+            print("    %s -> %s ok" % (spec["domain"], ", ".join(sorted(found))))
+
+    if args.check:
+        print("==> all checks passed, nothing deployed (--check)")
+        return
+
+    stage(6, "deploying")
+    payload = dict(spec, proxy=proxy)
+    payload.pop("host")
+    appdir = "%s/apps/%s" % (base, spec["app"])
+    if spec["build"]:
+        tarball = pack_context(spec["build"]["context"])
+        print("    uploading build context (%d KiB)" % (len(tarball) // 1024 + 1))
+        ssh(h, "mkdir -p %s && cat > %s/incoming.tar" % (shlex.quote(appdir), shlex.quote(appdir)), tarball)
+        payload["build"] = {"dockerfile": spec["build"]["dockerfile"]}
+    rc, result = ssh_stream(h, remote_agent(h, base, "deploy"), json.dumps(payload).encode())
+    if rc != 0 or not result:
+        die("deploy failed")
+
+    stage(7, "verifying")
+    if proxy["mode"] == "traefik-docker":
+        if dns_ok:
+            ok, detail = verify_https("https://%s%s" % (spec["domain"], spec["healthcheck"]))
+            if not ok:
+                die("app is running on the host but not reachable from here: %s" % detail)
+            print("    %s" % detail)
+        else:
+            print("    skipped public check (DNS not ready); Traefik will request the certificate "
+                  "once %s points here (redeploy to retrigger)" % spec["domain"])
+        url = "https://%s" % spec["domain"]
+    else:
+        url = "http://127.0.0.1:%s on the host (no proxy configured)" % result["host_port"]
+    print("==> %s release %s deployed: %s" % (spec["app"], result["release"], url))
+
+
+def cmd_destroy(args):
+    spec = load_spec(args.file)
+    h = host_args(spec)
+    if not args.yes:
+        answer = input("Destroy app %s on %s (container, images, state)? [y/N] " % (spec["app"], h.target))
+        if answer.strip().lower() not in ("y", "yes"):
+            print("aborted")
+            return
+    base = locate_agent(h)
+    rc, _ = ssh_stream(h, remote_agent(h, base, "destroy " + shlex.quote(spec["app"])))
+    sys.exit(rc)
+
+
+def cmd_logs(args):
+    spec = load_spec(args.file)
+    h = host_args(spec)
+    base = locate_agent(h)
+    rc, _ = ssh_stream(h, remote_agent(h, base, "logs %s -n %d" % (shlex.quote(spec["app"]), args.lines)))
+    sys.exit(rc)
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="vps-supervisor", description=__doc__.split("\n")[0])
+    parser.add_argument("--version", action="version", version=VERSION)
+    sub = parser.add_subparsers(dest="command")
+    sub.required = True
+
+    p = sub.add_parser("deploy", help="check, provision and deploy an app from its deployment file")
+    p.add_argument("file", help="deployment file (YAML, any name)")
+    p.add_argument("--check", action="store_true", help="run all checks, deploy nothing")
+    p.add_argument("--skip-dns", action="store_true", help="deploy even if the domain does not point here")
+    p.set_defaults(func=cmd_deploy)
+
+    p = sub.add_parser("destroy", help="remove the app described by a deployment file")
+    p.add_argument("file")
+    p.add_argument("-y", "--yes", action="store_true")
+    p.set_defaults(func=cmd_destroy)
+
+    p = sub.add_parser("logs", help="show container logs of the app in a deployment file")
+    p.add_argument("file")
+    p.add_argument("-n", "--lines", type=int, default=100)
+    p.set_defaults(func=cmd_logs)
+
+    def remote(name, func, help_):
+        p = sub.add_parser(name, help=help_)
+        p.add_argument("target", help="ssh destination, e.g. root@1.2.3.4 or a Host from ~/.ssh/config")
+        p.add_argument("-p", "--port", type=int, help="ssh port")
+        p.add_argument("-i", "--identity", help="ssh private key")
+        p.add_argument("-o", "--ssh-option", action="append", help="extra ssh -o option (repeatable)")
+        p.add_argument("--prefix", help="install dir on host (default: %s for root, %s otherwise)"
+                       % (ROOT_BASE, USER_BASE))
+        p.set_defaults(func=func)
+        return p
+
+    remote("install", cmd_install, "install/upgrade the agent on a host over ssh")
+    remote("detect", cmd_detect, "re-run web stack detection on a host").add_argument(
+        "--json", action="store_true")
+    remote("status", cmd_status, "show agent config and apps on a host").add_argument(
+        "--json", action="store_true")
+    remote("uninstall", cmd_uninstall, "remove the agent from a host").add_argument(
+        "-y", "--yes", action="store_true", help="do not ask for confirmation")
+
+    agent = sub.add_parser("agent", help="commands executed on the host by the agent")
+    asub = agent.add_subparsers(dest="agent_command")
+    asub.required = True
+    for name, func in (("init", cmd_agent_init), ("detect", cmd_agent_detect),
+                       ("status", cmd_agent_status), ("version", cmd_agent_version),
+                       ("provision", cmd_agent_provision), ("deploy", cmd_agent_deploy),
+                       ("destroy", cmd_agent_destroy), ("logs", cmd_agent_logs)):
+        p = asub.add_parser(name)
+        p.add_argument("--base", help="agent home directory")
+        if name in ("destroy", "logs"):
+            p.add_argument("app")
+        if name == "logs":
+            p.add_argument("-n", "--lines", type=int, default=100)
+        p.set_defaults(func=func)
+    return parser
+
+
+def main(argv=None):
+    if sys.version_info < MIN_PYTHON:
+        die("python >= %d.%d required" % MIN_PYTHON)
+    args = build_parser().parse_args(argv)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

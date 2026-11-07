@@ -1,0 +1,5 @@
+app: static-site
+host: root@your-server
+domain: static.example.com
+build: .
+port: 80

@@ -1,0 +1,5 @@
+app: whoami
+host: root@your-server
+domain: whoami.example.com
+image: traefik/whoami:v1.10
+port: 80

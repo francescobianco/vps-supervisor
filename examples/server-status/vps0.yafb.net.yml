@@ -1,0 +1,25 @@
+# Deployment of server-status on vps0.yafb.net.
+# Everything about this deployment lives in this single file:
+#   ./vps-supervisor deploy examples/server-status/vps0.yafb.net.yml
+
+app: server-status
+runtime: docker               # docker (default) | host (planned: run on the machine)
+
+host: root@82.165.241.56      # ssh destination; or {ssh: ..., port: 22, identity: ~/.ssh/id_rsa}
+domain: vps0.yafb.net         # must resolve to the host, checked before deploying
+
+build: .                      # dir (relative to this file) containing the Dockerfile
+port: 8000                    # port the app listens on inside the container
+healthcheck: /health
+
+env:
+  STATUS_TITLE: vps0
+
+volumes:                      # read-only host files, used to report host name, OS and disk
+  - /etc/hostname:/host/hostname:ro
+  - /etc/os-release:/host/os-release:ro
+
+# proxy:                      # optional overrides of what the agent detects on the host
+#   network: proxy
+#   entrypoint: websecure
+#   certresolver: le
