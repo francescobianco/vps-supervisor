@@ -53,7 +53,31 @@ proxy:                        # opzionale: override dei parametri rilevati
   certresolver: le
 ```
 
-In arrivo: variabili autogenerate al deploy (segreti, password, …).
+### Variabili chieste al deploy
+
+Un valore di `env` nella forma `${prompt:Etichetta}` (input visibile) o
+`${secret:Etichetta}` (nascosto, chiesto due volte) non sta nel file: viene chiesto
+al **primo** deploy, salvato sul server in `<agent>/apps/<app>/vars.json` (permessi
+`0600`) e passato al container come normale variabile d'ambiente in tutti i deploy
+successivi. Così il file di deployment si può committare senza segreti.
+
+```yaml
+env:
+  ADMIN_USER: ${prompt:Username del pannello}
+  ADMIN_PASSWORD: ${secret:Password del pannello}
+```
+
+```sh
+./vps-supervisor deploy app.yml                       # chiede solo ciò che manca sul server
+./vps-supervisor deploy app.yml --ask ADMIN_PASSWORD  # richiede (e sostituisce) un valore
+./vps-supervisor deploy app.yml --ask all             # richiede tutto
+ADMIN_PASSWORD=… ./vps-supervisor deploy app.yml      # non interattivo (CI): preso dall'ambiente locale
+```
+
+`--check` dice quante variabili sono già salvate e quali verrebbero chieste; nello
+stato dell'app sul server i valori compaiono come `<prompted>`. `destroy` le cancella.
+
+In arrivo: variabili autogenerate al deploy (segreti casuali).
 
 ## Casi di proxy classificati
 

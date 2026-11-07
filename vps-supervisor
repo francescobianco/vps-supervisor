@@ -35,7 +35,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 MIN_PYTHON = (3, 8)
 WEB_PORTS = (80, 443)
 ROOT_BASE = "/opt/vps-supervisor"
@@ -489,6 +489,18 @@ def cmd_agent_deploy(args):
     name = "vps-" + app
     appdir = os.path.join(base, "apps", app)
     os.makedirs(appdir, exist_ok=True)
+
+    # prompted variables: answers persist in vars.json and become env of every release
+    prompts = spec.get("prompts") or {}
+    vars_file = os.path.join(appdir, "vars.json")
+    stored = read_json(vars_file, {})
+    stored.update(spec.pop("prompted", None) or {})
+    stored = {k: v for k, v in stored.items() if k in prompts}
+    missing = sorted(set(prompts) - set(stored))
+    if missing:
+        die("no value stored for prompted variables: %s" % ", ".join(missing))
+    write_private(vars_file, json.dumps(stored, indent=2))
+    spec["env"] = dict(spec["env"], **stored)
     state_file = os.path.join(appdir, "state.json")
     state = read_json(state_file)
     release = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
@@ -581,7 +593,7 @@ def cmd_agent_deploy(args):
 
     state["current"] = {"release": release, "image": image, "run": runargs,
                         "domain": spec.get("domain"), "deployed_at": now_iso()}
-    state["spec"] = spec
+    state["spec"] = dict(spec, env={k: ("<prompted>" if k in prompts else v) for k, v in spec["env"].items()})
     write_private(state_file, json.dumps(state, indent=2))
 
     # 4. prune old releases
@@ -593,6 +605,12 @@ def cmd_agent_deploy(args):
 
     print("RESULT " + json.dumps({"release": release, "image": image, "container": name,
                                   "mode": mode, "host_port": state.get("host_port")}), flush=True)
+
+
+def cmd_agent_vars(args):
+    """Names (never values) of the prompted variables already stored for an app."""
+    stored = read_json(os.path.join(agent_base(args), "apps", args.app, "vars.json"), {})
+    print(json.dumps(sorted(stored)))
 
 
 def cmd_agent_destroy(args):
@@ -619,6 +637,8 @@ def cmd_agent_logs(args):
 APP_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# env value asked at the first deploy and stored on the host: ${prompt:Label} or ${secret:Label}
+PROMPT_RE = re.compile(r"^\$\{(prompt|secret)(?::(.*))?\}$")
 SPEC_KEYS = ("app", "runtime", "host", "domain", "build", "image", "port", "healthcheck", "env", "volumes", "proxy")
 
 
@@ -790,6 +810,12 @@ def load_spec(path):
             errors.append("env: invalid variable name %r" % k)
         if "\n" in v:
             errors.append("env: %s must be a single line" % k)
+    prompts = {}
+    for k, v in list(env.items()):
+        m = PROMPT_RE.match(v)
+        if m:
+            prompts[k] = {"label": (m.group(2) or "").strip() or k, "secret": m.group(1) == "secret"}
+            del env[k]
 
     volumes = raw.get("volumes") or []
     if not isinstance(volumes, list) or not all(isinstance(v, str) and ":" in v for v in volumes):
@@ -804,7 +830,7 @@ def load_spec(path):
     if errors:
         die("invalid deployment file %s:\n  - %s" % (path, "\n  - ".join(errors)))
     return {"app": app, "runtime": runtime, "host": host, "domain": domain, "build": build, "image": image, "port": port,
-            "healthcheck": health, "env": env, "volumes": volumes, "proxy": proxy}
+            "healthcheck": health, "env": env, "prompts": prompts, "volumes": volumes, "proxy": proxy}
 
 
 def resolve_proxy(cfg, spec):
@@ -1106,6 +1132,40 @@ def host_args(spec, prefix=None):
                               ssh_option=h.get("ssh_options") or [], prefix=prefix or h.get("prefix"))
 
 
+def ask_prompted(spec, stored, ask):
+    """Values for prompted variables not stored on the host yet (or re-asked with --ask)."""
+    unknown = [n for n in ask if n != "all" and n not in spec["prompts"]]
+    if unknown:
+        die("--ask: %s not a prompted variable of this deployment" % ", ".join(unknown))
+    todo = [n for n in spec["prompts"] if n not in stored or n in ask or "all" in ask]
+    answers = {}
+    for name in todo:
+        p = spec["prompts"][name]
+        if os.environ.get(name):  # non-interactive (CI): take it from the local environment
+            answers[name] = os.environ[name]
+            print("    %s: taken from the local environment" % name)
+            continue
+        if not sys.stdin.isatty():
+            die("%s must be entered at the first deploy: run in a terminal or export %s locally"
+                % (name, name))
+        while True:
+            label = "    %s (%s): " % (p["label"], name)
+            if p["secret"]:
+                import getpass
+                value = getpass.getpass(label)
+                if value and getpass.getpass("    repeat %s: " % name) != value:
+                    print("    values do not match, try again")
+                    continue
+            else:
+                value = input(label).strip()
+            if "\n" in value or not value:
+                print("    a non-empty single line is required")
+                continue
+            answers[name] = value
+            break
+    return answers
+
+
 def cmd_deploy(args):
     total = 7
 
@@ -1158,12 +1218,20 @@ def cmd_deploy(args):
             dns_ok = True
             print("    %s -> %s ok" % (spec["domain"], ", ".join(sorted(found))))
 
+    stored = []
+    if spec["prompts"]:
+        _, out, _ = ssh(h, remote_agent(h, base, "vars " + shlex.quote(spec["app"])))
+        stored = json.loads(out or "[]")
+        missing = [n for n in spec["prompts"] if n not in stored]
+        print("    prompted variables: %d stored%s" % (
+            len(spec["prompts"]) - len(missing), (", to ask: " + ", ".join(missing)) if missing else ""))
+
     if args.check:
         print("==> all checks passed, nothing deployed (--check)")
         return
 
     stage(6, "deploying")
-    payload = dict(spec, proxy=proxy)
+    payload = dict(spec, proxy=proxy, prompted=ask_prompted(spec, stored, args.ask or []))
     payload.pop("host")
     appdir = "%s/apps/%s" % (base, spec["app"])
     if spec["build"]:
@@ -1226,6 +1294,8 @@ def build_parser():
     p.add_argument("file", help="deployment file (YAML, any name)")
     p.add_argument("--check", action="store_true", help="run all checks, deploy nothing")
     p.add_argument("--skip-dns", action="store_true", help="deploy even if the domain does not point here")
+    p.add_argument("--ask", action="append", metavar="VAR",
+                   help="ask again a prompted variable stored on the host (repeatable, or 'all')")
     p.set_defaults(func=cmd_deploy)
 
     p = sub.add_parser("destroy", help="remove the app described by a deployment file")
@@ -1263,10 +1333,10 @@ def build_parser():
     for name, func in (("init", cmd_agent_init), ("detect", cmd_agent_detect),
                        ("status", cmd_agent_status), ("version", cmd_agent_version),
                        ("provision", cmd_agent_provision), ("deploy", cmd_agent_deploy),
-                       ("destroy", cmd_agent_destroy), ("logs", cmd_agent_logs)):
+                       ("destroy", cmd_agent_destroy), ("logs", cmd_agent_logs), ("vars", cmd_agent_vars)):
         p = asub.add_parser(name)
         p.add_argument("--base", help="agent home directory")
-        if name in ("destroy", "logs"):
+        if name in ("destroy", "logs", "vars"):
             p.add_argument("app")
         if name == "logs":
             p.add_argument("-n", "--lines", type=int, default=100)
